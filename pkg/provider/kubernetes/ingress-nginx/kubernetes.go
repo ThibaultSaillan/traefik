@@ -314,7 +314,7 @@ func (p *Provider) loadConfiguration(ctx context.Context) *dynamic.Configuration
 				Service:    defaultBackendName,
 			}
 
-			if err := p.applyMiddlewares(ingress.Namespace, defaultBackendName, ingressConfig, hasTLS, rt, conf); err != nil {
+			if err := p.applyMiddlewares(ingress.Namespace, defaultBackendName, ingressConfig, hasTLS, rt, conf, nil); err != nil {
 				logger.Error().Err(err).Msg("Error applying middlewares")
 			}
 
@@ -329,7 +329,7 @@ func (p *Provider) loadConfiguration(ctx context.Context) *dynamic.Configuration
 				TLS:        &dynamic.RouterTLSConfig{},
 			}
 
-			if err := p.applyMiddlewares(ingress.Namespace, defaultBackendTLSName, ingressConfig, false, rtTLS, conf); err != nil {
+			if err := p.applyMiddlewares(ingress.Namespace, defaultBackendTLSName, ingressConfig, false, rtTLS, conf, nil); err != nil {
 				logger.Error().Err(err).Msg("Error applying middlewares")
 			}
 
@@ -406,7 +406,7 @@ func (p *Provider) loadConfiguration(ctx context.Context) *dynamic.Configuration
 					Service:    key,
 				}
 
-				if err := p.applyMiddlewares(ingress.Namespace, key, ingressConfig, hasTLS, rt, conf); err != nil {
+				if err := p.applyMiddlewares(ingress.Namespace, key, ingressConfig, hasTLS, rt, conf, nil); err != nil {
 					logger.Error().Err(err).Msg("Error applying middlewares")
 				}
 
@@ -420,7 +420,7 @@ func (p *Provider) loadConfiguration(ctx context.Context) *dynamic.Configuration
 					TLS:        &dynamic.RouterTLSConfig{},
 				}
 
-				if err := p.applyMiddlewares(ingress.Namespace, key+"-tls", ingressConfig, false, rtTLS, conf); err != nil {
+				if err := p.applyMiddlewares(ingress.Namespace, key+"-tls", ingressConfig, false, rtTLS, conf, nil); err != nil {
 					logger.Error().Err(err).Msg("Error applying middlewares")
 				}
 
@@ -485,7 +485,7 @@ func (p *Provider) loadConfiguration(ctx context.Context) *dynamic.Configuration
 					conf.HTTP.ServersTransports[namedServersTransport.Name] = namedServersTransport.ServersTransport
 				}
 
-				if err := p.applyMiddlewares(ingress.Namespace, routerKey, ingressConfig, hasTLS, rt, conf); err != nil {
+				if err := p.applyMiddlewares(ingress.Namespace, routerKey, ingressConfig, hasTLS, rt, conf, &pa); err != nil {
 					logger.Error().Err(err).Msg("Error applying middlewares")
 				}
 			}
@@ -785,7 +785,9 @@ func (p *Provider) loadCertificates(ctx context.Context, ingress *netv1.Ingress,
 	return nil
 }
 
-func (p *Provider) applyMiddlewares(namespace, routerKey string, ingressConfig ingressConfig, hasTLS bool, rt *dynamic.Router, conf *dynamic.Configuration) error {
+func (p *Provider) applyMiddlewares(namespace, routerKey string, ingressConfig ingressConfig, hasTLS bool, rt *dynamic.Router, conf *dynamic.Configuration, pa *netv1.HTTPIngressPath) error {
+	applyRewriteTargetConfiguration(routerKey, ingressConfig, pa, rt, conf)
+
 	if err := p.applyBasicAuthConfiguration(namespace, routerKey, ingressConfig, rt, conf); err != nil {
 		return fmt.Errorf("applying basic auth configuration: %w", err)
 	}
@@ -809,6 +811,63 @@ func (p *Provider) applyMiddlewares(namespace, routerKey string, ingressConfig i
 	}
 
 	return nil
+}
+
+func applyRewriteTargetConfiguration(routerName string, ingressConfig ingressConfig, pa *netv1.HTTPIngressPath, rt *dynamic.Router, conf *dynamic.Configuration) {
+	target := ptr.Deref(ingressConfig.RewriteTarget, "")
+	if target == "" || pa == nil || pa.Path == "" {
+		return
+	}
+
+	regex := buildRewriteTargetRegex(*pa)
+	if regex == "" {
+		return
+	}
+
+	middlewareName := routerName + "-rewrite-target"
+	conf.HTTP.Middlewares[middlewareName] = &dynamic.Middleware{
+		ReplacePathRegex: &dynamic.ReplacePathRegex{
+			Regex:       regex,
+			Replacement: target,
+		},
+	}
+
+	rt.Middlewares = prependMiddleware(rt.Middlewares, middlewareName)
+}
+
+func buildRewriteTargetRegex(pa netv1.HTTPIngressPath) string {
+	path := pa.Path
+	if path == "" {
+		return ""
+	}
+
+	pathType := ptr.Deref(pa.PathType, netv1.PathTypePrefix)
+	if pathType == netv1.PathTypeImplementationSpecific {
+		pathType = netv1.PathTypePrefix
+	}
+
+	switch pathType {
+	case netv1.PathTypeExact:
+		return "^" + regexp.QuoteMeta(path) + "$"
+	case netv1.PathTypePrefix:
+		if path == "/" {
+			// Keep compatibility with common ingress-nginx rewrite-target patterns (e.g. /$2).
+			return "^(/|$)(.*)"
+		}
+
+		trimmed := strings.TrimSuffix(path, "/")
+		return "^" + regexp.QuoteMeta(trimmed) + "(/|$)(.*)"
+	default:
+		return "^" + regexp.QuoteMeta(path) + "(/|$)(.*)"
+	}
+}
+
+func prependMiddleware(middlewares []string, middleware string) []string {
+	if len(middlewares) == 0 {
+		return []string{middleware}
+	}
+
+	return append([]string{middleware}, middlewares...)
 }
 
 func (p *Provider) applyCustomHeaders(routerName string, ingressConfig ingressConfig, rt *dynamic.Router, conf *dynamic.Configuration) error {
